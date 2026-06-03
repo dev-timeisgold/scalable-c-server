@@ -2,8 +2,8 @@
  * ==============================================================================
  * 프로젝트    : 확장 가능한 C 서버 (Scalable C Server)
  * 파일명      : server.c
- * 설명        : Phase 2 - 멀티 스레드 기반 TCP 에코 서버
- * 아키텍처    : 연결당 스레드 모델 (메인 스레드는 연결 수락, 워커 스레드는 통신 전담)
+ * 설명        : Phase 3 - epoll 기반 I/O 멀티플렉싱 서버
+ * 아키텍처    : 이벤트 기반 단일 스레드 구조 (Event-Driven Single Thread)
  * ==============================================================================
  */
 
@@ -13,123 +13,96 @@
  #include <unistd.h>
  #include <arpa/inet.h>
  #include <sys/socket.h>
- #include <pthread.h> 
+ #include <sys/epoll.h> // epoll 전광판 기능을 위한 헤더 파일
  
  #define PORT 8080
  #define BUFFER_SIZE 1024
- #define MAX_QUEUE 3
+ #define MAX_EVENTS 10  // 전광판에 한 번에 띄울 수 있는 최대 알림 개수
  
- /*
-  * ------------------------------------------------------------------------------
-  * 함수명      : handle_client
-  * 설명        : 1:1 클라이언트 통신을 전담하여 처리하는 워커 스레드 루틴.
-  * 매개변수    : arg - 동적 할당된 클라이언트 소켓 파일 디스크립터(FD)의 포인터
-  * 반환값      : NULL (스레드 업무 종료 시 자동 반환)
-  * ------------------------------------------------------------------------------
-  */
- void *handle_client(void *arg) {
-     // 1. 소켓 FD 값을 복사하고, 메모리 누수를 방지하기 위해 전달받은 힙 메모리 해제
-     int client_socket = *((int *)arg);
-     free(arg); 
- 
-     char buffer[BUFFER_SIZE];
-     memset(buffer, 0, BUFFER_SIZE);
- 
-     printf("[정보] 스레드 시작. 할당된 클라이언트 소켓: %d\n", client_socket);
- 
-     // 2. 클라이언트의 메시지가 도착할 때까지 대기 (read - 블로킹)
-     if (read(client_socket, buffer, BUFFER_SIZE) > 0) {
-         printf("[수신 - 소켓 %d] %s\n", client_socket, buffer);
- 
-         // 3. 수신한 메시지를 클라이언트에게 그대로 반사 (send)
-         send(client_socket, buffer, strlen(buffer), 0);
-         printf("[송신 - 소켓 %d] 메시지 에코 완료.\n", client_socket);
-     }
- 
-     // 4. 통신이 완료되면 소켓을 닫고 연결 종료
-     close(client_socket);
-     printf("[정보] 스레드 종료. 클라이언트 소켓 %d 닫힘.\n", client_socket);
- 
-     return NULL;
- }
- 
- /*
-  * ------------------------------------------------------------------------------
-  * 함수명      : main
-  * 설명        : 서버 프로그램의 진입점. 수신용 대기 소켓을 설정하고,
-  * 무한 루프를 돌며 들어오는 클라이언트의 연결을 수락합니다.
-  * ------------------------------------------------------------------------------
-  */
  int main() {
-     int server_fd, client_socket;
+     int server_fd, client_socket, epoll_fd, event_count;
      struct sockaddr_in address;
      int opt = 1;
      int addrlen = sizeof(address);
+     char buffer[BUFFER_SIZE];
  
-     // [1단계] 서버 소켓 생성 (IPv4, TCP)
+     // epoll 전용 구조체 (호출 벨과 전광판 알림을 담는 그릇)
+     struct epoll_event event;
+     struct epoll_event events[MAX_EVENTS];
+ 
+     // [1단계] 서버 정문(Listen Socket) 개설 (Phase 1, 2와 동일)
      server_fd = socket(AF_INET, SOCK_STREAM, 0);
-     if (server_fd == 0) {
-         perror("[오류] 소켓 생성 실패");
-         exit(EXIT_FAILURE);
-     }
- 
-     // [2단계] 소켓 옵션 설정 (서버 재시작 시 "Address already in use" 포트 잠김 에러 방지)
-     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-         perror("[오류] setsockopt 설정 실패");
-         exit(EXIT_FAILURE);
-     }
- 
-     // [3단계] 서버 주소 구조체 초기화 및 소켓에 바인딩(결합)
+     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+     
      memset(&address, 0, sizeof(address));
      address.sin_family = AF_INET;
      address.sin_addr.s_addr = INADDR_ANY;
      address.sin_port = htons(PORT);
+     
+     bind(server_fd, (struct sockaddr *)&address, sizeof(address));
+     listen(server_fd, 3);
+     printf("[시스템] epoll 기반 싱글 스레드 서버가 %d번 포트에서 가동 중입니다...\n", PORT);
  
-     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-         perror("[오류] 바인드 실패");
+     // ==========================================================================
+     // [2단계] epoll 마법의 시작 (전광판 구매 및 정문 등록)
+     // ==========================================================================
+ 
+     // 1. epoll_create1: 사장님이 볼 거대한 알림 전광판 생성
+     epoll_fd = epoll_create1(0);
+     if (epoll_fd == -1) {
+         perror("[오류] epoll 전광판 생성 실패");
          exit(EXIT_FAILURE);
      }
  
-     // [4단계] 클라이언트 연결 수신 대기열(Listen Queue) 생성
-     if (listen(server_fd, MAX_QUEUE) < 0) {
-         perror("[오류] 수신 대기(listen) 실패");
-         exit(EXIT_FAILURE);
-     }
-     printf("[시스템] 멀티 스레드 서버가 %d번 포트에서 가동 중입니다...\n", PORT);
+     // 2. 정문(server_fd)에 호출 벨을 달아서 전광판에 등록 (epoll_ctl)
+     // "누군가 정문에 오면(EPOLLIN), 전광판에 server_fd 번호로 알림을 띄워라!"
+     event.events = EPOLLIN; 
+     event.data.fd = server_fd;
+     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event);
  
-     // [5단계] 클라이언트 연결 수락 무한 루프 (메인 스레드 전담 업무)
+     // ==========================================================================
+     // [3단계] 24시간 이벤트 처리 루프 (단 1명의 사장님이 모든 것을 통제)
+     // ==========================================================================
      while (1) {
-         // 새로운 클라이언트가 접속할 때까지 여기서 실행을 멈추고 대기 (블로킹)
-         client_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
-         if (client_socket < 0) {
-             perror("[경고] 연결 수락 실패. 다음 연결을 기다립니다...");
-             continue;
+         // 3. epoll_wait: 전광판만 쳐다보며 대기 (아무도 안 부르면 여기서 휴식)
+         // 알림이 울리면 울린 개수만큼 event_count에 숫자가 담김
+         event_count = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+ 
+         // 울린 알림(이벤트)들을 하나씩 확인하며 처리
+         for (int i = 0; i < event_count; i++) {
+             int active_fd = events[i].data.fd; // 알림이 울린 소켓 번호
+ 
+             // 케이스 A: 정문(server_fd)에서 알림이 울린 경우 (새로운 손님 도착!)
+             if (active_fd == server_fd) {
+                 client_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
+                 printf("\n[시스템] 새로운 연결 수락됨. 소켓 FD: %d\n", client_socket);
+ 
+                 // 새로 온 손님 테이블(client_socket)에도 호출 벨을 달아서 전광판에 등록
+                 event.events = EPOLLIN;
+                 event.data.fd = client_socket;
+                 epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket, &event);
+             }
+             // 케이스 B: 기존 손님 테이블(client_socket)에서 알림이 울린 경우 (메시지 도착!)
+             else {
+                 memset(buffer, 0, BUFFER_SIZE);
+                 int read_bytes = read(active_fd, buffer, BUFFER_SIZE);
+ 
+                 if (read_bytes <= 0) {
+                     // 손님이 나갔거나 에러 발생 시: 전광판에서 벨을 떼고 테이블 정리
+                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, active_fd, NULL);
+                     close(active_fd);
+                     printf("[시스템] 클라이언트 소켓 %d 연결 종료 및 전광판에서 제거됨.\n", active_fd);
+                 } else {
+                     // 손님이 정상적으로 메시지를 보낸 경우: 메아리(Echo) 전송
+                     printf("[수신 - 소켓 %d] %s\n", active_fd, buffer);
+                     send(active_fd, buffer, read_bytes, 0);
+                     printf("[송신 - 소켓 %d] 메시지 에코 완료.\n", active_fd);
+                 }
+             }
          }
- 
-         printf("\n[시스템] 새로운 연결 수락됨. 소켓 FD: %d\n", client_socket);
- 
-         // 데이터 경합(Data Race)을 방지하기 위해 새로운 힙 메모리에 소켓 번호를 기록
-         int *new_sock = malloc(sizeof(int));
-         if (new_sock == NULL) {
-             perror("[오류] 메모리 할당 실패");
-             close(client_socket);
-             continue;
-         }
-         *new_sock = client_socket;
- 
-         // 클라이언트를 응대할 새로운 워커 스레드(알바생) 고용
-         pthread_t thread_id;
-         if (pthread_create(&thread_id, NULL, handle_client, (void *)new_sock) != 0) {
-             perror("[오류] 스레드 생성 실패");
-             free(new_sock);
-             close(client_socket);
-             continue;
-         }
- 
-         // 스레드를 분리(Detach)하여, 업무가 끝나면 메인 스레드의 확인(join) 없이 즉시 메모리를 반환하도록 설정
-         pthread_detach(thread_id);
      }
  
      close(server_fd);
+     close(epoll_fd);
      return 0;
  }
